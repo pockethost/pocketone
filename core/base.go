@@ -76,6 +76,10 @@ type BaseAppConfig struct {
 	// AppMigrations, when set, is used instead of the global [AppMigrations] list by RunAppMigrations,
 	// RunAllMigrations, the jsvm plugin and the migrate command (see [AppMigrationsOf]).
 	AppMigrations *MigrationsList
+
+	// OnLog, when set, is called with every log entry the app's logger accepts (before the logs settings decide
+	// whether it is stored), e.g. to copy them to a host's per-app log. It must not block or log.
+	OnLog func(log *logger.Log)
 }
 
 // ensures that the BaseApp implements the App interface.
@@ -1622,6 +1626,10 @@ func (app *BaseApp) initLogger() error {
 		Level:     getLoggerMinLevel(app),
 		BatchSize: 200,
 		BeforeAddFunc: func(ctx context.Context, log *logger.Log) bool {
+			if app.config.OnLog != nil { // PocketOne
+				app.config.OnLog(log)
+			}
+
 			if app.IsDev() {
 				printLog(log)
 
