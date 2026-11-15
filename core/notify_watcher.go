@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"ganigeorgiev.com/pocketbase/pocketbase/tools/hook"
@@ -17,7 +18,8 @@ import (
 const systemHookIdNotifyWatcher = "__pbNotifyWatcherSystemHook__"
 
 func (app *BaseApp) registerNotifyWatcherHooks() {
-	var notifyWatcher *fsnotify.Watcher
+	// stops the watcher and waits for its goroutine (see createNotifyDirWatcher)
+	var stopNotifyWatcher func()
 
 	instanceId := "@" + security.PseudorandomString(10)
 
@@ -34,11 +36,11 @@ func (app *BaseApp) registerNotifyWatcherHooks() {
 				return err
 			}
 
-			if notifyWatcher != nil {
-				_ = notifyWatcher.Close()
+			if stopNotifyWatcher != nil {
+				stopNotifyWatcher()
 			}
 
-			notifyWatcher, err = createNotifyDirWatcher(e.App, instanceId, localNotifyDirPath)
+			stopNotifyWatcher, err = createNotifyDirWatcher(e.App, instanceId, localNotifyDirPath)
 			if err != nil {
 				e.App.Logger().Warn("Notify dir watcher failure.", "error", err)
 			}
@@ -48,12 +50,26 @@ func (app *BaseApp) registerNotifyWatcherHooks() {
 		Priority: -998,
 	})
 
+	// stop the watcher before the bootstrap state (the DB handles) is cleared; its goroutine reads it
+	app.OnBootstrapClear().Bind(&hook.Handler[*BootstrapEvent]{
+		Id: systemHookIdNotifyWatcher,
+		Func: func(e *BootstrapEvent) error {
+			if stopNotifyWatcher != nil {
+				stopNotifyWatcher()
+				stopNotifyWatcher = nil
+			}
+			return e.Next()
+		},
+		Priority: -998,
+	})
+
 	// cleanup
 	app.OnTerminate().Bind(&hook.Handler[*TerminateEvent]{
 		Id: systemHookIdNotifyWatcher,
 		Func: func(e *TerminateEvent) error {
-			if notifyWatcher != nil {
-				_ = notifyWatcher.Close()
+			if stopNotifyWatcher != nil {
+				stopNotifyWatcher()
+				stopNotifyWatcher = nil
 			}
 
 			_ = os.Remove(settingsFile)
@@ -72,7 +88,7 @@ func (app *BaseApp) registerNotifyWatcherHooks() {
 			return err
 		}
 
-		if notifyWatcher != nil {
+		if stopNotifyWatcher != nil {
 			if err := os.WriteFile(settingsFile, nil, 0644); err != nil {
 				e.App.Logger().Warn("Failed to write watcher file", "error", err, "file", settingsFile)
 			}
@@ -99,7 +115,7 @@ func (app *BaseApp) registerNotifyWatcherHooks() {
 			return err
 		}
 
-		if notifyWatcher != nil {
+		if stopNotifyWatcher != nil {
 			if err := os.WriteFile(collectionsFile, nil, 0644); err != nil {
 				e.App.Logger().Warn("Failed to write watcher file", "error", err, "file", collectionsFile)
 			}
@@ -125,7 +141,10 @@ func (app *BaseApp) registerNotifyWatcherHooks() {
 	})
 }
 
-func createNotifyDirWatcher(app App, instanceId string, localNotifyDirPath string) (*fsnotify.Watcher, error) {
+// createNotifyDirWatcher starts watching the notify dir and returns a stop func. Stop closes the watcher and waits
+// for its goroutine and any reload already running, so nothing reads the app after it returns. Don't call stop from
+// inside a reload (an OnSettingsReload hook): it waits for that reload and would deadlock.
+func createNotifyDirWatcher(app App, instanceId string, localNotifyDirPath string) (func(), error) {
 	// create the notify dir (if not already)
 	err := os.MkdirAll(localNotifyDirPath, os.ModePerm)
 	if err != nil {
@@ -145,6 +164,12 @@ func createNotifyDirWatcher(app App, instanceId string, localNotifyDirPath strin
 
 	var debounceTimer *time.Timer
 
+	// done closes when the goroutine returns; mu is held by a running reload, and stopped turns away a reload that
+	// starts after stop returns
+	done := make(chan struct{})
+	var mu sync.Mutex
+	stopped := false
+
 	stopDebounceTimer := func() {
 		if debounceTimer != nil {
 			debounceTimer.Stop()
@@ -154,6 +179,7 @@ func createNotifyDirWatcher(app App, instanceId string, localNotifyDirPath strin
 
 	// watch
 	routine.FireAndForget(func() {
+		defer close(done)
 		defer stopDebounceTimer()
 
 		for {
@@ -171,6 +197,12 @@ func createNotifyDirWatcher(app App, instanceId string, localNotifyDirPath strin
 				stopDebounceTimer()
 
 				debounceTimer = time.AfterFunc(50*time.Millisecond, func() {
+					mu.Lock()
+					defer mu.Unlock()
+					if stopped {
+						return
+					}
+
 					filename := filepath.Base(event.Name)
 
 					// settings changed
@@ -207,5 +239,13 @@ func createNotifyDirWatcher(app App, instanceId string, localNotifyDirPath strin
 		}
 	})
 
-	return watcher, err
+	stop := func() {
+		_ = watcher.Close()
+		<-done
+		mu.Lock()
+		stopped = true
+		mu.Unlock()
+	}
+
+	return stop, err
 }
