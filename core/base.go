@@ -161,6 +161,7 @@ type BaseApp struct {
 	// @todo 2: if exposed consider registering the same for the backup filesystem
 	_onFilesystemNewWriter *hook.Hook[*FilesystemNewWriterEvent]
 	_onFilesystemDelete    *hook.Hook[*FilesystemDeleteEvent]
+	onFilesystemCreate     *hook.Hook[*FilesystemCreateEvent] // PocketOne
 
 	// realtime api event hooks
 	onRealtimeConnectRequest   *hook.Hook[*RealtimeConnectRequestEvent]
@@ -314,6 +315,7 @@ func (app *BaseApp) initHooks() {
 	// filesystem event hooks
 	app._onFilesystemNewWriter = &hook.Hook[*FilesystemNewWriterEvent]{}
 	app._onFilesystemDelete = &hook.Hook[*FilesystemDeleteEvent]{}
+	app.onFilesystemCreate = &hook.Hook[*FilesystemCreateEvent]{} // PocketOne
 
 	// realtime API event hooks
 	app.onRealtimeConnectRequest = &hook.Hook[*RealtimeConnectRequestEvent]{}
@@ -748,6 +750,47 @@ func (app *BaseApp) NewMailClient() mailer.Mailer {
 // NB! Make sure to call Close() on the returned result
 // after you are done working with it.
 func (app *BaseApp) NewFilesystem() (fsys *filesystem.System, err error) {
+	// PocketOne: OnFilesystemCreate handlers may supply it (createFilesystem); the rest is upstream's NewFilesystem split
+	// into defaultFilesystem and attachFilesystemHooks.
+	fsys, err = app.createFilesystem(FilesystemKindStorage, app.defaultFilesystem)
+	if err != nil {
+		return nil, err
+	}
+
+	return app.attachFilesystemHooks(fsys), nil
+}
+
+// PocketOne: createFilesystem lets OnFilesystemCreate handlers supply the filesystem, else creates the default one.
+func (app *BaseApp) createFilesystem(kind string, def func() (*filesystem.System, error)) (*filesystem.System, error) {
+	if app.onFilesystemCreate == nil || app.onFilesystemCreate.Length() == 0 {
+		return def()
+	}
+
+	event := &FilesystemCreateEvent{App: app, Kind: kind}
+	err := app.onFilesystemCreate.Trigger(event, func(e *FilesystemCreateEvent) error {
+		if e.Filesystem == nil {
+			fsys, err := def()
+			if err != nil {
+				return err
+			}
+			e.Filesystem = fsys
+		}
+		return e.Next()
+	})
+	if err != nil {
+		if event.Filesystem != nil {
+			event.Filesystem.Close()
+		}
+		return nil, err
+	}
+	if event.Filesystem == nil { // a handler stopped the chain without supplying one
+		return def()
+	}
+
+	return event.Filesystem, nil
+}
+
+func (app *BaseApp) defaultFilesystem() (fsys *filesystem.System, err error) {
 	if app.settings != nil && app.settings.S3.Enabled {
 		// S3
 		fsys, err = filesystem.NewS3(
@@ -762,10 +805,11 @@ func (app *BaseApp) NewFilesystem() (fsys *filesystem.System, err error) {
 		// local filesystem
 		fsys, err = filesystem.NewLocal(filepath.Join(app.DataDir(), LocalStorageDirName))
 	}
-	if err != nil {
-		return nil, err
-	}
 
+	return fsys, err
+}
+
+func (app *BaseApp) attachFilesystemHooks(fsys *filesystem.System) *filesystem.System {
 	// attach delete hook
 	if app._onFilesystemDelete.Length() > 0 {
 		fsys.OnDelete().BindFunc(func(originalEvent *filesystem.DeleteEvent) error {
@@ -792,7 +836,7 @@ func (app *BaseApp) NewFilesystem() (fsys *filesystem.System, err error) {
 		})
 	}
 
-	return fsys, nil
+	return fsys
 }
 
 // NewBackupsFilesystem creates a new local or S3 filesystem instance
@@ -801,6 +845,10 @@ func (app *BaseApp) NewFilesystem() (fsys *filesystem.System, err error) {
 // NB! Make sure to call Close() on the returned result
 // after you are done working with it.
 func (app *BaseApp) NewBackupsFilesystem() (*filesystem.System, error) {
+	return app.createFilesystem(FilesystemKindBackups, app.defaultBackupsFilesystem) // PocketOne: OnFilesystemCreate
+}
+
+func (app *BaseApp) defaultBackupsFilesystem() (*filesystem.System, error) {
 	if app.settings != nil && app.settings.Backups.S3.Enabled {
 		return filesystem.NewS3(
 			app.settings.Backups.S3.Bucket,
@@ -1090,6 +1138,11 @@ func (app *BaseApp) OnMailerRecordAuthAlertSend(tags ...string) *hook.TaggedHook
 // -------------------------------------------------------------------
 // Filesystem event hooks
 // -------------------------------------------------------------------
+
+// PocketOne: see [App.OnFilesystemCreate].
+func (app *BaseApp) OnFilesystemCreate() *hook.Hook[*FilesystemCreateEvent] {
+	return app.onFilesystemCreate
+}
 
 func (app *BaseApp) onFilesystemNewWriter() *hook.Hook[*FilesystemNewWriterEvent] {
 	return app._onFilesystemNewWriter
