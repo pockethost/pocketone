@@ -70,6 +70,12 @@ type BaseAppConfig struct {
 	AuxMaxOpenConns  int
 	AuxMaxIdleConns  int
 	IsDev            bool
+
+	// PocketOne: per-app settings so several apps can share one process.
+
+	// AppMigrations, when set, is used instead of the global [AppMigrations] list by RunAppMigrations,
+	// RunAllMigrations, the jsvm plugin and the migrate command (see [AppMigrationsOf]).
+	AppMigrations *MigrationsList
 }
 
 // ensures that the BaseApp implements the App interface.
@@ -619,6 +625,29 @@ func (app *BaseApp) DataDir() string {
 	return app.config.DataDir
 }
 
+// PocketOne: AppMigrationsOf returns the app's own migrations list ([BaseAppConfig.AppMigrations]) when it has one,
+// otherwise the global [AppMigrations]. Register and run app migrations through it so each app in a shared process
+// keeps its own.
+func AppMigrationsOf(app App) *MigrationsList {
+	type withList interface{ appMigrations() *MigrationsList }
+	if a, ok := app.(withList); ok {
+		return a.appMigrations()
+	}
+	// a wrapper embedding the App interface (e.g. *pocketbase.PocketBase): its hookless copy is the *BaseApp
+	if a, ok := app.UnsafeWithoutHooks().(withList); ok {
+		return a.appMigrations()
+	}
+	return &AppMigrations
+}
+
+// PocketOne: unexported, so it isn't on the App API (nor reachable from JS); embedding *BaseApp keeps it.
+func (app *BaseApp) appMigrations() *MigrationsList {
+	if app.config.AppMigrations != nil {
+		return app.config.AppMigrations
+	}
+	return &AppMigrations
+}
+
 // EncryptionEnv returns the name of the app secret env key
 // (currently used primarily for optional settings encryption but this may change in the future).
 func (app *BaseApp) EncryptionEnv() string {
@@ -901,18 +930,19 @@ func (app *BaseApp) RunSystemMigrations() error {
 	return err
 }
 
-// RunAppMigrations applies all new migrations registered in the [core.AppMigrations] list.
+// RunAppMigrations applies all new migrations registered in the [core.AppMigrations] list
+// (PocketOne: or the app's own list, see [AppMigrationsOf]).
 func (app *BaseApp) RunAppMigrations() error {
-	_, err := NewMigrationsRunner(app, AppMigrations).Up()
+	_, err := NewMigrationsRunner(app, *app.appMigrations()).Up() // PocketOne: per-app list
 	return err
 }
 
 // RunAllMigrations applies all system and app migrations
-// (aka. from both [core.SystemMigrations] and [core.AppMigrations]).
+// (aka. from both [core.SystemMigrations] and [core.AppMigrations]; PocketOne: or the app's own list, see [AppMigrationsOf]).
 func (app *BaseApp) RunAllMigrations() error {
 	list := MigrationsList{}
 	list.Copy(SystemMigrations)
-	list.Copy(AppMigrations)
+	list.Copy(*app.appMigrations()) // PocketOne: per-app list
 	_, err := NewMigrationsRunner(app, list).Up()
 	return err
 }
